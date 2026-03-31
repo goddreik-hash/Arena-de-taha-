@@ -1,0 +1,977 @@
+local Script;
+for i,v in next, getgc() do
+    if type(v) == "function" then
+        if islclosure(v) and not iscclosure(v) then
+            if tostring(getfenv(v).script) == "LocalScript" then
+                Script = getfenv(v)
+            end
+        end
+    end
+end
+local OldIndex;
+OldIndex = hookmetamethod(game, "__index", newcclosure(function(Self, Method, ...)
+    if getfenv(debug.info(2, "f")) == Script then
+        print(Self, Method, ...)
+        return wait(9e9)
+    end
+    return OldIndex(Self, Method, ...)
+end))
+
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local StarterGui = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer
+
+
+
+local Window = WindUI:CreateWindow({
+    Title = "taha arena",
+    Icon = "rbxthumb://type=Asset&id=80622869023191&w=150&h=150",
+    Author = "arena taha",
+    Folder = "NeoxHub",
+    Size = UDim2.fromOffset(550, 400),
+    Transparent = false,
+    Theme = "Dark",
+    SideBarWidth = 200,
+})
+
+Window:SetToggleKey(Enum.KeyCode.Q)
+
+
+
+local HomeTab = Window:Tab({
+    Title = "Home",
+    Icon = "home",
+})
+
+local ArenaFarmTab = Window:Tab({
+    Title = "Arena Farm",
+    Icon = "swords",
+})
+
+HomeTab:Select()
+
+
+
+HomeTab:Divider()
+
+HomeTab:Section({ Title = "Discord Server" })
+
+HomeTab:Button({
+    Title = "Join our Discord",
+    Desc = "Click this button to copy the invite link!",
+    Callback = function()
+        local inviteLink = "https://discord.gg/99UuEwM9sX"
+        if setclipboard then
+            setclipboard(inviteLink)
+            WindUI:Notify({
+                Title = "NEOX HUB",
+                Content = "Discord invite link copied!",
+                Duration = 5,
+            })
+        else
+            WindUI:Notify({
+                Title = "NEOX HUB",
+                Content = "Clipboard not supported by this executor.",
+                Duration = 5,
+            })
+        end
+    end
+})
+
+HomeTab:Paragraph({
+    Title = "Report/Suggestion",
+    Desc = "Join our Discord server to report issues or suggest new features",
+})
+
+
+
+local lp = Players.LocalPlayer
+
+local Config = {
+    AutoArenaBrainrotEnabled = true,
+    ArenaTweenSpeedMultiplier = 550,
+    SelectedArenaRarities = {"Divine", "Infinity"},
+    ArenaHeight = 40,
+    ArenaInstantBase = true,
+    CarryLimit = 1,
+}
+
+local ARENA_PICKUP_Y_OFFSET = 3
+
+local bodyVelocity = nil
+local bodyPosition = nil
+local originalGravity = nil
+
+local characterFullyLoaded = false
+local canTeleport          = false
+local currentlyFarming     = nil
+local tweenMoving          = false
+
+local arenaScriptRunning = false
+local arenaLoopActive    = true
+local arenaReturning     = false
+
+local arenaTweenData = { currentTween=nil, currentDummy=nil, currentMoveConn=nil, isActive=false, currentTarget=nil }
+
+local brainrotRarityCache = nil
+
+local function readGameSpeed()
+    local ok, s = pcall(function() return lp:GetAttribute("CurrentSpeed") end)
+    if ok and type(s) == "number" and s > 0 then return s end
+    return 16
+end
+local cachedGameSpeed = readGameSpeed()
+lp:GetAttributeChangedSignal("CurrentSpeed"):Connect(function() cachedGameSpeed = readGameSpeed() end)
+
+
+local SPECIAL_RARITY_MAPPING = {
+    ["Biscotti Macarotti"]       = "Divine",
+    ["Cioccolatone Draghettone"] = "Celestial",
+    ["Cupitron Consoletron"]     = "Divine",
+    ["Gatti Marshmallini"]       = "Cosmic",
+    ["Kissarini Heartini"]       = "Secret",
+    ["Polpo Semaforini"]         = "Celestial",
+    ["Tartarughi Attrezzini"]    = "Secret",
+}
+
+local brainrotData = {
+    Rarities = {"Common","Uncommon","Rare","Epic","Legendary","Mythical","Cosmic","Secret","Celestial","Divine","Infinity","Phantom","Paradox"},
+}
+
+local RARITY_PRIORITY = {}
+for i, r in ipairs({"Common","Uncommon","Rare","Epic","Legendary","Mythical","Cosmic","Secret","Celestial","Divine","Infinity","Phantom","Paradox"}) do
+    RARITY_PRIORITY[r] = i
+end
+
+local function getRarityPriority(rarity) return RARITY_PRIORITY[rarity] or 0 end
+
+local function buildBrainrotRarityCache()
+    local cache = {}
+    local bf = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Brainrots")
+    if bf then
+        for _, rf in ipairs(bf:GetChildren()) do
+            if rf:IsA("Folder") then
+                for _, m in ipairs(rf:GetChildren()) do
+                    if m:IsA("Model") then cache[m.Name] = SPECIAL_RARITY_MAPPING[m.Name] or rf.Name end
+                end
+            end
+        end
+    end
+    for n, r in pairs(SPECIAL_RARITY_MAPPING) do if not cache[n] then cache[n] = r end end
+    return cache
+end
+
+local function getBrainrotRarity(name)
+    if not brainrotRarityCache then brainrotRarityCache = buildBrainrotRarityCache() end
+    return brainrotRarityCache[name]
+end
+
+local function isRarityMatch(rarityText, sel)
+    if #sel == 0 then return true end
+    for _, r in ipairs(sel) do if rarityText == r then return true end end
+    return false
+end
+
+
+local function getCharacter() return lp.Character end
+
+local function waitForCharacter()
+    local char = lp.Character or lp.CharacterAdded:Wait()
+    local hrp  = char:WaitForChild("HumanoidRootPart", 10)
+    local hum  = char:WaitForChild("Humanoid", 10)
+    if not hrp or not hum then return nil, nil, nil end
+    if hum.Health <= 0 then
+        char = lp.CharacterAdded:Wait()
+        hrp  = char:WaitForChild("HumanoidRootPart", 10)
+        hum  = char:WaitForChild("Humanoid", 10)
+        if not hrp or not hum then return nil, nil, nil end
+    end
+    return char, hrp, hum
+end
+
+local function unequipTools()
+    local c = lp.Character; if not c then return end
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if hum then pcall(function() hum:UnequipTools() end) end
+end
+
+local function cleanupTweenData(td)
+    if td.currentTween    then pcall(function() td.currentTween:Cancel()       end) td.currentTween    = nil end
+    if td.currentMoveConn then pcall(function() td.currentMoveConn:Disconnect() end) td.currentMoveConn = nil end
+    if td.currentDummy    then pcall(function() td.currentDummy:Destroy()       end) td.currentDummy    = nil end
+    td.isActive = false; td.currentTarget = nil
+end
+
+
+local function getArenaBase()
+    local bases = workspace:FindFirstChild("Bases")
+    if not bases then return nil end
+    local uid = tostring(lp.UserId)
+    for _, base in ipairs(bases:GetChildren()) do
+        local holder = base:GetAttribute("Holder")
+        if holder and tostring(holder) == uid then
+            return base
+        end
+    end
+    return nil
+end
+
+local function getArenaBasePosition()
+    local base = getArenaBase()
+    if not base then return nil end
+    if base.PrimaryPart then return base.PrimaryPart.Position end
+    local ok, pos = pcall(function() return base:GetPivot().Position end)
+    if ok and pos then return pos end
+    for _, part in ipairs(base:GetDescendants()) do
+        if part:IsA("BasePart") then return part.Position end
+    end
+    return nil
+end
+
+local idlePinConn   = nil
+local idlePinX      = 0
+local idlePinZ      = 0
+local idlePinY      = 40
+local idlePinActive = false
+
+local function setIdlePin(x, y, z) idlePinX = x; idlePinY = y; idlePinZ = z end
+
+local function freezeHere()
+    idlePinActive = true
+    local c = lp.Character
+    local h = c and c:FindFirstChild("HumanoidRootPart")
+    if h then
+        idlePinX = h.Position.X
+        idlePinY = h.Position.Y
+        idlePinZ = h.Position.Z
+    end
+end
+
+local function unfreeze() idlePinActive = false end
+
+local function startIdlePin()
+    if idlePinConn then return end
+    idlePinConn = RunService.Heartbeat:Connect(function()
+        if not idlePinActive then return end
+        local ch = lp.Character; if not ch then return end
+        local hrp = ch:FindFirstChild("HumanoidRootPart")
+        local hm  = ch:FindFirstChild("Humanoid")
+        if hrp then
+            hrp.CFrame = CFrame.new(idlePinX, idlePinY, idlePinZ)
+            pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+            pcall(function() hrp.AssemblyAngularVelocity = Vector3.zero end)
+        end
+        if hm then pcall(function() hm:ChangeState(Enum.HumanoidStateType.Physics) end) end
+    end)
+end
+
+local function stopIdlePin()
+    idlePinActive = false
+    if idlePinConn then pcall(function() idlePinConn:Disconnect() end) idlePinConn = nil end
+end
+
+local function enableMovementControl()
+    pcall(function()
+        local char = lp.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char:FindFirstChild("Humanoid")
+        if hrp and humanoid then
+            humanoid.PlatformStand = true
+            humanoid.AutoRotate = false
+            humanoid.WalkSpeed = 0
+            humanoid.JumpPower = 0
+            if bodyVelocity then pcall(function() bodyVelocity:Destroy() end) end
+            if bodyPosition then pcall(function() bodyPosition:Destroy() end) end
+            bodyVelocity = Instance.new("BodyVelocity")
+            bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+            bodyVelocity.MaxForce = Vector3.new(0, 9e9, 0)
+            bodyVelocity.P = 10000
+            bodyVelocity.Parent = hrp
+            bodyPosition = Instance.new("BodyPosition")
+            bodyPosition.Position = hrp.Position
+            bodyPosition.MaxForce = Vector3.new(9e9, 0, 9e9)
+            bodyPosition.P = 10000
+            bodyPosition.D = 1000
+            bodyPosition.Parent = hrp
+            if not originalGravity then originalGravity = workspace.Gravity end
+            workspace.Gravity = 0
+        end
+    end)
+end
+
+local function disableMovementControl()
+    pcall(function()
+        local char = lp.Character
+        if char then
+            local humanoid = char:FindFirstChild("Humanoid")
+            if humanoid then
+                humanoid.PlatformStand = false
+                humanoid.AutoRotate = true
+                humanoid.WalkSpeed = 16
+                humanoid.JumpPower = 50
+            end
+        end
+        if bodyVelocity then pcall(function() bodyVelocity:Destroy() end) bodyVelocity = nil end
+        if bodyPosition then pcall(function() bodyPosition:Destroy() end) bodyPosition = nil end
+        if originalGravity then workspace.Gravity = originalGravity; originalGravity = nil end
+    end)
+end
+
+
+local function arenaIsCarrying()
+    local char = lp.Character
+    if not char then return false end
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Tool") or (child:IsA("Model") and child:GetAttribute("BrainrotName")) then
+            return true
+        end
+    end
+    local bp = lp:FindFirstChild("Backpack")
+    if bp then
+        for _, child in ipairs(bp:GetChildren()) do
+            if child:IsA("Tool") or (child:IsA("Model") and child:GetAttribute("BrainrotName")) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+
+local function getCarryCount()
+    local count = 0
+    local char = lp.Character
+    if char then
+        for _, child in ipairs(char:GetChildren()) do
+            if child:IsA("Tool") or (child:IsA("Model") and child:GetAttribute("BrainrotName")) then
+                count = count + 1
+            end
+        end
+    end
+    local bp = lp:FindFirstChild("Backpack")
+    if bp then
+        for _, child in ipairs(bp:GetChildren()) do
+            if child:IsA("Tool") or (child:IsA("Model") and child:GetAttribute("BrainrotName")) then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+local function tweenToPos(targetPos, tweenData, configCheck, speedOverride, forceY)
+    if not characterFullyLoaded or not canTeleport then return false end
+    if not configCheck() then return false end
+    local char, hrp, hum = waitForCharacter()
+    if not char or not hrp or not hum or hum.Health <= 0 then return false end
+    cleanupTweenData(tweenData)
+    currentlyFarming = "arena"
+    tweenMoving = true
+    unfreeze()
+
+    local rawSpd = speedOverride ~= nil and speedOverride
+        or (Config.ArenaTweenSpeedMultiplier ~= nil and Config.ArenaTweenSpeedMultiplier or cachedGameSpeed)
+    local spd = math.max(rawSpd, 1)
+
+    local tx, tz = targetPos.X, targetPos.Z
+    local targetY = forceY ~= nil and forceY or Config.ArenaHeight
+
+    enableMovementControl()
+    hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z)
+    if bodyPosition then
+        bodyPosition.Position = Vector3.new(hrp.Position.X, targetY, hrp.Position.Z)
+    end
+
+    local dist = math.sqrt((tx - hrp.Position.X)^2 + (tz - hrp.Position.Z)^2)
+    if dist < 1 then
+        hrp.CFrame = CFrame.new(tx, targetY, tz)
+        if bodyPosition then bodyPosition.Position = Vector3.new(tx, targetY, tz) end
+        disableMovementControl()
+        tweenMoving = false
+        setIdlePin(tx, targetY, tz)
+        freezeHere()
+        return true
+    end
+
+    local dur = dist / spd
+    local tw = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), {CFrame = CFrame.new(tx, targetY, tz)})
+    tweenData.currentTween = tw
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if hrp and hrp.Parent and bodyPosition then
+            bodyPosition.Position = Vector3.new(hrp.Position.X, targetY, hrp.Position.Z)
+        end
+    end)
+    tweenData.currentMoveConn = conn
+
+    tw:Play()
+    local completed = false
+    tw.Completed:Connect(function() completed = true end)
+
+    while not completed do
+        if not configCheck() or not canTeleport then
+            tw:Cancel()
+            conn:Disconnect()
+            disableMovementControl()
+            tweenMoving = false
+            cleanupTweenData(tweenData)
+            currentlyFarming = nil
+            freezeHere()
+            return false
+        end
+        task.wait()
+    end
+
+    conn:Disconnect()
+    tweenData.currentMoveConn = nil
+    if hrp and hrp.Parent then
+        hrp.CFrame = CFrame.new(tx, targetY, tz)
+        if bodyPosition then bodyPosition.Position = Vector3.new(tx, targetY, tz) end
+    end
+    disableMovementControl()
+    tweenMoving = false
+    cleanupTweenData(tweenData)
+    setIdlePin(tx, targetY, tz)
+    freezeHere()
+    return true
+end
+
+
+local function snapToY(y)
+    local char, hrp = waitForCharacter()
+    if not hrp then return end
+    unfreeze()
+    enableMovementControl()
+    hrp.CFrame = CFrame.new(hrp.Position.X, y, hrp.Position.Z)
+    if bodyPosition then
+        bodyPosition.Position = Vector3.new(hrp.Position.X, y, hrp.Position.Z)
+    end
+    setIdlePin(hrp.Position.X, y, hrp.Position.Z)
+    freezeHere()
+    disableMovementControl()
+end
+
+
+local function arenaPickup(model, rootPart, configCheck)
+    if not model:IsDescendantOf(workspace) then return false end
+    local pickupY = rootPart.Position.Y + ARENA_PICKUP_Y_OFFSET
+    snapToY(pickupY)
+    task.wait(0.1)
+    local hrp = getCharacter() and getCharacter():FindFirstChild("HumanoidRootPart")
+    if not hrp then snapToY(Config.ArenaHeight); return false end
+    local prompt = rootPart:FindFirstChild("TakePrompt") or rootPart:FindFirstChildOfClass("ProximityPrompt")
+    if not prompt or not prompt.Enabled then snapToY(Config.ArenaHeight); return false end
+    pcall(function()
+        firetouchinterest(hrp, rootPart, 0)
+        task.wait(0.02)
+        firetouchinterest(hrp, rootPart, 1)
+    end)
+    pcall(function() prompt:InputHoldBegin() end)
+    local holdDuration = (prompt.HoldDuration and prompt.HoldDuration > 0) and prompt.HoldDuration or 3.0
+    local startT = tick()
+    local pickedUp = false
+    while tick() - startT < holdDuration + 0.2 do
+        if not configCheck() then
+            pcall(function() prompt:InputHoldEnd() end)
+            snapToY(Config.ArenaHeight)
+            return false
+        end
+        if not model:IsDescendantOf(workspace) then pickedUp = true; break end
+        if not prompt or not prompt.Parent or not prompt.Enabled then pickedUp = true; break end
+        pcall(function()
+            firetouchinterest(hrp, rootPart, 0)
+            task.wait(0.02)
+            firetouchinterest(hrp, rootPart, 1)
+        end)
+        task.wait(0.05)
+    end
+    pcall(function() prompt:InputHoldEnd() end)
+    task.wait(0.15)
+    if not pickedUp then pickedUp = not model:IsDescendantOf(workspace) end
+    snapToY(Config.ArenaHeight)
+    return pickedUp
+end
+
+
+local function arenaDepositAtBase(configCheck)
+    local basePos = getArenaBasePosition()
+    if not basePos then
+        unequipTools()
+        task.wait(1)
+        return true
+    end
+
+    local tx, tz = basePos.X, basePos.Z
+    local targetY = Config.ArenaHeight
+
+    if Config.ArenaInstantBase then
+        if not arenaIsCarrying() then return false end
+        local char, hrp = waitForCharacter()
+        if char and hrp then
+            hrp.CFrame = CFrame.new(tx, targetY, tz)
+        end
+        setIdlePin(tx, targetY, tz)
+        freezeHere()
+        unequipTools()
+        task.wait(1)
+        unfreeze()
+        return true
+    end
+
+    local char, hrp, hum = waitForCharacter()
+    if not char or not hrp then return true end
+
+    cleanupTweenData(arenaTweenData)
+    currentlyFarming = "arena"
+    tweenMoving = true
+    unfreeze()
+
+    local rawSpd = Config.ArenaTweenSpeedMultiplier ~= nil and Config.ArenaTweenSpeedMultiplier or cachedGameSpeed
+    local spd = math.max(rawSpd, 1)
+
+    enableMovementControl()
+    hrp.CFrame = CFrame.new(hrp.Position.X, targetY, hrp.Position.Z)
+    if bodyPosition then bodyPosition.Position = Vector3.new(hrp.Position.X, targetY, hrp.Position.Z) end
+
+    local dist = math.sqrt((tx - hrp.Position.X)^2 + (tz - hrp.Position.Z)^2)
+    local lostMidFlight = false
+
+    if dist < 1 then
+        hrp.CFrame = CFrame.new(tx, targetY, tz)
+        if bodyPosition then bodyPosition.Position = Vector3.new(tx, targetY, tz) end
+        disableMovementControl()
+        tweenMoving = false
+        setIdlePin(tx, targetY, tz)
+        freezeHere()
+    else
+        local dur = dist / spd
+        local tw = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), {CFrame = CFrame.new(tx, targetY, tz)})
+        arenaTweenData.currentTween = tw
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if hrp and hrp.Parent and bodyPosition then
+                bodyPosition.Position = Vector3.new(hrp.Position.X, targetY, hrp.Position.Z)
+            end
+        end)
+        arenaTweenData.currentMoveConn = conn
+        tw:Play()
+        local completed = false
+        tw.Completed:Connect(function() completed = true end)
+        while not completed do
+            if not configCheck() or not canTeleport then
+                tw:Cancel(); conn:Disconnect()
+                disableMovementControl(); tweenMoving = false
+                cleanupTweenData(arenaTweenData); currentlyFarming = nil
+                freezeHere(); return true
+            end
+            if not arenaIsCarrying() then
+                tw:Cancel(); conn:Disconnect()
+                disableMovementControl(); tweenMoving = false
+                cleanupTweenData(arenaTweenData); currentlyFarming = nil
+                freezeHere(); lostMidFlight = true; break
+            end
+            task.wait()
+        end
+        if not lostMidFlight then
+            conn:Disconnect(); arenaTweenData.currentMoveConn = nil
+            if hrp and hrp.Parent then
+                hrp.CFrame = CFrame.new(tx, targetY, tz)
+                if bodyPosition then bodyPosition.Position = Vector3.new(tx, targetY, tz) end
+            end
+            disableMovementControl(); tweenMoving = false
+            cleanupTweenData(arenaTweenData)
+            setIdlePin(tx, targetY, tz); freezeHere()
+        end
+    end
+
+    if lostMidFlight then return false end
+
+    local ch2, hrp2 = waitForCharacter()
+    if ch2 and hrp2 then hrp2.CFrame = CFrame.new(tx, targetY, tz) end
+    setIdlePin(tx, targetY, tz)
+    freezeHere()
+    unequipTools()
+    task.wait(1)
+    unfreeze()
+    return true
+end
+
+
+local function stopFarmMode()
+    cleanupTweenData(arenaTweenData)
+    tweenMoving = false
+    arenaScriptRunning = false
+    arenaReturning = false
+    currentlyFarming = nil
+    if not Config.AutoArenaBrainrotEnabled then
+        stopIdlePin()
+        local char = getCharacter()
+        if char then
+            local hum = char:FindFirstChild("Humanoid")
+            if hum then task.delay(0.1, function() pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end) end) end
+        end
+    end
+end
+
+
+lp.CharacterAdded:Connect(function(newChar)
+    characterFullyLoaded = false; canTeleport = false
+    cleanupTweenData(arenaTweenData)
+    tweenMoving = false
+    currentlyFarming = nil; stopIdlePin()
+    arenaScriptRunning = false; arenaReturning = false
+    newChar:WaitForChild("HumanoidRootPart", 10); newChar:WaitForChild("Humanoid", 10)
+    task.wait(2); characterFullyLoaded = true; task.wait(0.5); canTeleport = true
+    startIdlePin()
+    if Config.AutoArenaBrainrotEnabled then freezeHere() end
+end)
+
+task.spawn(function()
+    if waitForCharacter() then
+        task.wait(1); characterFullyLoaded = true; task.wait(0.5); canTeleport = true
+        startIdlePin()
+        if Config.AutoArenaBrainrotEnabled then freezeHere() end
+    end
+end)
+
+
+local function arenaBrainrotFarmLoop()
+    while arenaLoopActive do
+        task.wait(0.05)
+        if Config.AutoArenaBrainrotEnabled and not arenaScriptRunning and characterFullyLoaded and canTeleport then
+            arenaScriptRunning = true
+            task.spawn(function()
+                arenaReturning = false
+
+                while Config.AutoArenaBrainrotEnabled and arenaScriptRunning and characterFullyLoaded and canTeleport do
+                    local char, hrp, hum = waitForCharacter()
+                    if not char or not hrp or not hum or hum.Health <= 0 then
+                        waitForCharacter(); continue
+                    end
+
+                    local cc = function()
+                        return Config.AutoArenaBrainrotEnabled and arenaScriptRunning and canTeleport
+                    end
+
+                    local hasBrainrot = false
+                    for _, child in ipairs(char:GetChildren()) do
+                        if child:IsA("Tool") or (child:IsA("Model") and child:GetAttribute("BrainrotName")) then
+                            hasBrainrot = true; break
+                        end
+                    end
+                    if hasBrainrot then
+                        arenaReturning = true
+                        arenaDepositAtBase(cc)
+                        arenaReturning = false
+                        continue
+                    end
+
+                    local basePos = getArenaBasePosition()
+                    if not basePos then
+                        freezeHere(); task.wait(1); continue
+                    end
+
+                    local ab = workspace:FindFirstChild("ArenaBrainrots")
+                    local candidates = {}
+                    if ab then
+                        for _, v in ipairs(ab:GetDescendants()) do
+                            if v:IsA("Model") and v.Parent and v.Parent.Name == "RenderedBrainrot" then
+                                local root = v.Parent:FindFirstChild("Root")
+                                if root then
+                                    local rm = #Config.SelectedArenaRarities == 0
+                                    if not rm then
+                                        local r = getBrainrotRarity(v.Name)
+                                        rm = r and isRarityMatch(r, Config.SelectedArenaRarities)
+                                    end
+                                    if rm then
+                                        local d = (hrp.Position - root.Position).Magnitude
+                                        local rp = getRarityPriority(getBrainrotRarity(v.Name))
+                                        table.insert(candidates, {model=v, root=root, dist=d, rp=rp})
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    table.sort(candidates, function(a, b)
+                        if a.rp ~= b.rp then return a.rp > b.rp end
+                        return a.dist < b.dist
+                    end)
+
+                    if #candidates == 0 then
+                        freezeHere(); task.wait(0.5); continue
+                    end
+
+                    local pickedCount = 0
+
+                    for _, target in ipairs(candidates) do
+                        if not cc() then break end
+                        if pickedCount >= Config.CarryLimit then break end
+                        if not target.model:IsDescendantOf(workspace) then continue end
+
+                        local pr = target.root:FindFirstChild("TakePrompt") or target.root:FindFirstChildOfClass("ProximityPrompt")
+                        if not pr or not pr.Enabled then continue end
+
+                        local ok = tweenToPos(
+                            Vector3.new(target.root.Position.X, Config.ArenaHeight, target.root.Position.Z),
+                            arenaTweenData, cc
+                        )
+                        if not ok then continue end
+                        if not target.model:IsDescendantOf(workspace) then freezeHere(); continue end
+
+                        local picked = arenaPickup(target.model, target.root, cc)
+                        if picked then
+                            unequipTools()
+                            pickedCount = pickedCount + 1
+                        end
+                    end
+
+                    if pickedCount > 0 then
+                        arenaReturning = true
+                        arenaDepositAtBase(cc)
+                        arenaReturning = false
+                    end
+
+                    if not Config.AutoArenaBrainrotEnabled then
+                        arenaScriptRunning = false; arenaReturning = false
+                        currentlyFarming = nil; break
+                    end
+                end
+                arenaReturning = false; arenaScriptRunning = false
+            end)
+        elseif not Config.AutoArenaBrainrotEnabled then
+            arenaScriptRunning = false
+        end
+    end
+end
+
+
+task.spawn(arenaBrainrotFarmLoop)
+
+local function getDefaultSpeedStr() return tostring(math.floor(cachedGameSpeed)) end
+
+
+
+ArenaFarmTab:Section({ Title = "Auto Farm Arena Brainrots" })
+
+ArenaFarmTab:Input({
+    Title = "Arena Tween Speed (studs/sec)",
+    Desc = "",
+    Value = "550",
+    Placeholder = "Enter speed...",
+    Callback = function(v)
+        local n = tonumber(v)
+        Config.ArenaTweenSpeedMultiplier = n and math.max(n, 1) or nil
+    end
+})
+
+ArenaFarmTab:Input({
+    Title = "Arena Height (world Y, default 40)",
+    Desc = "",
+    Value = "40",
+    Placeholder = "Enter height...",
+    Callback = function(v)
+        local n = tonumber(v)
+        Config.ArenaHeight = n and math.max(n, 1) or 40
+    end
+})
+
+ArenaFarmTab:Input({
+    Title = "Carry Limit (default 1)",
+    Desc = "How many brainrots to pick up before depositing at base",
+    Value = "1",
+    Placeholder = "Enter carry limit...",
+    Callback = function(v)
+        local n = tonumber(v)
+        Config.CarryLimit = n and math.max(math.floor(n), 1) or 1
+    end
+})
+
+ArenaFarmTab:Toggle({
+    Title = "Instant Base",
+    Desc = "",
+    Value = true,
+    Callback = function(state)
+        Config.ArenaInstantBase = state
+    end
+})
+
+ArenaFarmTab:Toggle({
+    Title = "Auto Farm Arena Brainrots",
+    Desc = "",
+    Value = true,
+    Callback = function(state)
+        Config.AutoArenaBrainrotEnabled = state
+        if not state then stopFarmMode() else startIdlePin(); freezeHere() end
+    end
+})
+
+ArenaFarmTab:Dropdown({
+    Title = "Select Rarities (Multi-Select)",
+    Desc = "",
+    Values = brainrotData.Rarities,
+    Value = {"Divine", "Infinity"},
+    Multi = true,
+    AllowNone = true,
+    Callback = function(selectedTable)
+        Config.SelectedArenaRarities = {}
+        if type(selectedTable) == "table" then
+            for _, r in ipairs(selectedTable) do
+                table.insert(Config.SelectedArenaRarities, r)
+            end
+        end
+    end
+})
+
+
+
+ArenaFarmTab:Section({ Title = "Auto Attack" })
+
+local AttackSpeed = 55
+local AutoAttackEnabled = true
+local AntiRagdollEnabled = true
+local Timer = 0
+
+ArenaFarmTab:Toggle({
+    Title = "Auto Attack",
+    Desc = "",
+    Value = true,
+    Callback = function(state)
+        AutoAttackEnabled = state
+    end
+})
+
+ArenaFarmTab:Toggle({
+    Title = "Anti Hit",
+    Desc = "",
+    Value = true,
+    Callback = function(state)
+        AntiRagdollEnabled = state
+    end
+})
+
+ArenaFarmTab:Slider({
+    Title = "Attack Speed",
+    Desc = "",
+    Step = 1,
+    Value = {
+        Min = 40,
+        Max = 1000,
+        Default = 55,
+    },
+    Callback = function(value)
+        AttackSpeed = value
+    end
+})
+
+
+local function GetNearestPlayer()
+    local Closest, Shortest = nil, 30
+    for _, Player in pairs(Players:GetPlayers()) do
+        local Char = Player.Character
+        if Player ~= LocalPlayer and Char
+            and Char:FindFirstChild("HumanoidRootPart")
+            and Char:FindFirstChild("Humanoid")
+            and Char.Humanoid.Health > 0 then
+            local Dist = (LocalPlayer.Character.HumanoidRootPart.Position - Char.HumanoidRootPart.Position).Magnitude
+            if Dist < Shortest then
+                Shortest = Dist
+                Closest = Player
+            end
+        end
+    end
+    return Closest
+end
+
+local function ApplyAntiRagdoll(Character)
+    local Humanoid = Character:WaitForChild("Humanoid")
+    Humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    Humanoid.BreakJointsOnDeath = false
+end
+
+local function GetOrCreateHitbox(Handle)
+    local Hitbox = Handle:FindFirstChild("AminHitbox")
+    if not Hitbox then
+        Hitbox = Instance.new("Part")
+        Hitbox.Name = "AminHitbox"
+        Hitbox.Parent = Handle
+        Hitbox.Transparency = 1
+        Hitbox.CanCollide = false
+        Hitbox.Massless = true
+        Instance.new("Weld", Hitbox).Part0 = Handle
+    end
+    Hitbox.Size = Vector3.new(24, 24, 24)
+    return Hitbox
+end
+
+LocalPlayer.CharacterAdded:Connect(function(Character)
+    if AntiRagdollEnabled then
+        ApplyAntiRagdoll(Character)
+    end
+end)
+
+if LocalPlayer.Character then
+    local Humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
+    if Humanoid then
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        Humanoid.BreakJointsOnDeath = false
+    end
+end
+
+RunService.Heartbeat:Connect(function(Delta)
+    local Character = LocalPlayer.Character
+    if not Character then return end
+
+    if AntiRagdollEnabled then
+        pcall(function()
+            local Humanoid = Character:FindFirstChild("Humanoid")
+            if Humanoid and Humanoid:GetState() == Enum.HumanoidStateType.Ragdoll then
+                Humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+                Humanoid:ChangeState(Enum.HumanoidStateType.Running)
+            end
+        end)
+    end
+
+    if AutoAttackEnabled then
+        local Tool = Character:FindFirstChildOfClass("Tool")
+        if Tool then
+            Tool:Activate()
+            local Handle = Tool:FindFirstChild("Handle")
+                or Tool:FindFirstChildOfClass("Part")
+                or Tool:FindFirstChildOfClass("MeshPart")
+            if Handle then
+                GetOrCreateHitbox(Handle)
+
+                local Target = GetNearestPlayer()
+                if Target and Target.Character:FindFirstChild("HumanoidRootPart") then
+                    local TargetHRP = Target.Character.HumanoidRootPart
+
+                    for _, obj in pairs(Character:GetDescendants()) do
+                        if (obj:IsA("Weld") or obj:IsA("ManualWeld") or obj:IsA("RightGrip"))
+                            and (obj.Part1 == Handle or obj.Part0 == Handle) then
+                            obj:Destroy()
+                        end
+                    end
+
+                    Timer += Delta * (AttackSpeed / 10)
+                    Handle.CFrame = TargetHRP.CFrame * CFrame.new(math.cos(Timer), 0, math.sin(Timer))
+                    firetouchinterest(TargetHRP, Handle, 0)
+                    firetouchinterest(TargetHRP, Handle, 1)
+                end
+            end
+        end
+    end
+end)
